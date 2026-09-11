@@ -1,0 +1,353 @@
+Kong
+===========
+Kong Gateway is an API Gateway / reverse proxy. It sits between your clients and your backend services:
+
+                    ┌─────────────────┐
+                    │   Web / Mobile  │
+                    │   API Clients   │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │  KONG GATEWAY   │
+                    │                 │
+                    │ Authentication  │
+                    │ Rate limiting   │
+                    │ Logging         │
+                    │ Routing         │
+                    │ Security        │
+                    └────────┬────────┘
+                             │
+             ┌───────────────┼───────────────┐
+             ▼               ▼               ▼
+        User Service    Order Service    Payment Service
+        :3001           :3002            :3003
+
+Kong receives the request, decides where it should go, and can apply policies such as authentication, rate limiting, logging, CORS, transformations, etc.
+
+The 4 concepts you should learn first
+
+1. Service → your backend application.
+
+http://localhost:3001
+
+2. Route → the URL/path through which clients access that service.
+
+/api/users
+
+3. Consumer → a client/user/application consuming your API.
+
+4. Plugin → additional functionality such as:
+
+API key authentication
+JWT authentication
+Rate limiting
+CORS
+Logging
+Prometheus metrics
+Request/response transformation
+
+Kong's Services represent upstream applications, while Routes determine how incoming requests are matched to those Services.
+
+2. How I recommend you learn Kong
+
+Don't start by trying to learn everything.
+
+Follow this order:
+
+HTTP / REST APIs
+       ↓
+Reverse Proxy
+       ↓
+Kong Gateway
+       ↓
+Services + Routes
+       ↓
+Plugins
+       ↓
+Authentication
+       ↓
+Rate Limiting
+       ↓
+PostgreSQL / DB-less
+       ↓
+decK
+       ↓
+Docker
+       ↓
+Kubernetes + Kong Ingress Controller
+       ↓
+Production architecture
+3. First setup: Kong with Docker
+
+For learning, Docker is probably the easiest way to start. Kong officially provides Docker-based installation options.
+
+Install:
+
+Docker Desktop if you're on Windows/Mac
+Docker Engine + Compose if you're on Linux
+
+Then create a directory:
+
+mkdir kong-learning
+cd kong-learning
+
+For a first hands-on environment, you can use Kong's official Docker Compose setup. Their current documentation provides a Compose configuration with Kong and PostgreSQL.
+
+You can also use Kong's quickstart for a faster local installation.
+
+4. Your first Kong API
+
+Suppose you have an application:
+
+http://localhost:3000
+
+and it has:
+
+GET /users
+GET /users/1
+POST /users
+
+Without Kong:
+
+Client ───────────────> localhost:3000/users
+
+With Kong:
+
+Client
+   │
+   ▼
+Kong :8000
+   │
+   ▼
+localhost:3000
+
+You configure a Service:
+
+services:
+  - name: user-service
+    url: http://host.docker.internal:3000
+
+Then a Route:
+
+routes:
+  - name: user-route
+    service:
+      name: user-service
+    paths:
+      - /users
+
+Now the client can call:
+
+curl http://localhost:8000/users
+
+and Kong forwards the request to your backend.
+
+The basic Service + Route model is the heart of Kong.
+
+5. Then learn Plugins
+
+This is where Kong becomes really interesting.
+
+For example, imagine your API:
+
+Client
+   │
+   ▼
+ Kong
+   │
+   ├── Authentication
+   ├── Rate Limiting
+   ├── CORS
+   ├── Logging
+   └── Metrics
+   │
+   ▼
+ Backend API
+
+Instead of implementing authentication and rate limiting separately in every microservice, Kong can handle these concerns at the gateway layer.
+
+Kong's plugin architecture is specifically designed to add this type of functionality.
+
+For example:
+
+/api/users
+/api/orders
+/api/payments
+
+could all have:
+
+JWT Authentication
+Rate Limiting
+Logging
+
+without putting that code into each backend.
+
+6. Learn authentication
+
+After Services, Routes and Plugins, I'd learn:
+
+API Key
+Client
+   │
+   │ X-API-Key
+   ▼
+ Kong
+   │
+   ▼
+ API
+JWT
+Client
+   │
+   │ Authorization: Bearer <JWT>
+   ▼
+ Kong
+   │
+   ├── Validate JWT
+   │
+   ▼
+ API
+
+Then move into OAuth/OIDC and enterprise authentication.
+
+7. Learn rate limiting
+
+For example:
+
+Client A ──┐
+Client B ──┼──> Kong ──> API
+Client C ──┘
+
+You might configure:
+
+100 requests / minute
+
+When a client exceeds the limit:
+
+HTTP 429 Too Many Requests
+
+This is one of the most common real-world API Gateway use cases.
+
+8. Learn DB vs DB-less Kong
+
+This is an important concept.
+
+Traditional/database mode
+             ┌────────────┐
+             │ PostgreSQL │
+             └─────▲──────┘
+                   │
+                   │
+              ┌────┴────┐
+Client ──────>│  Kong   │────> API
+              └─────────┘
+
+Kong stores entities such as Services, Routes, Consumers and Plugins in PostgreSQL.
+
+DB-less mode
+kong.yml
+   │
+   ▼
+ Kong
+   │
+   ▼
+ APIs
+
+Configuration is provided declaratively, without PostgreSQL.
+
+For learning, DB-less mode is actually a nice place to start because you can understand configuration as code.
+
+9. Learn decK
+
+Once you understand Kong manually, learn decK.
+
+decK is Kong's configuration management CLI. It lets you manage Kong configuration using declarative YAML files.
+
+For example:
+
+_format_version: "3.0"
+
+services:
+  - name: user-service
+    url: http://user-service:3000
+
+    routes:
+      - name: users
+        paths:
+          - /users
+
+Then your Kong configuration becomes something you can put into Git:
+
+Git
+ │
+ ▼
+kong.yaml
+ │
+ ▼
+decK
+ │
+ ▼
+Kong
+
+This is much closer to how you'll encounter Kong in real projects.
+
+10. Finally learn Kong + Kubernetes
+
+If you're learning Kong because you want to work with DevOps / Kubernetes / cloud, this should be your eventual target:
+
+                    Internet
+                       │
+                       ▼
+                 Load Balancer
+                       │
+                       ▼
+               Kong Gateway
+                       │
+              ┌────────┼────────┐
+              ▼        ▼        ▼
+            User     Order    Payment
+           Service  Service   Service
+              │        │        │
+              └────────┼────────┘
+                       ▼
+                  Kubernetes
+
+Then learn Kong Ingress Controller (KIC), which lets you configure Kong using Kubernetes-native resources. Kong's current documentation supports deployment through Kubernetes/Helm and describes KIC as a way to manage ingress traffic and routing.
+
+A practical Kong learning project
+
+I'd recommend building this rather than just watching tutorials:
+
+                 ┌─────────────┐
+                 │   Client    │
+                 └──────┬──────┘
+                        │
+                        ▼
+                 ┌─────────────┐
+                 │    Kong     │
+                 │             │
+                 │ JWT         │
+                 │ Rate Limit  │
+                 │ CORS        │
+                 │ Logging     │
+                 └──────┬──────┘
+                        │
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+     User API       Order API     Product API
+      :3001           :3002          :3003
+
+Build it in this order:
+
+Day 1: Docker + Kong installation
+Day 2: Services and Routes
+Day 3: Kong Admin API
+Day 4: Plugins
+Day 5: API Key + JWT authentication
+Day 6: Rate limiting + CORS
+Day 7: PostgreSQL and DB-less mode
+Day 8: decK + Git
+Day 9: Monitoring/logging
+Day 10: Kubernetes + Kong Ingress Controller
+
+The official Kong docs have a current getting-started guide and installation guides if you want to follow along with the latest version.
