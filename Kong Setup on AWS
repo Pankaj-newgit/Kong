@@ -1,0 +1,764 @@
+Kong setup at AWS 
+===================
+
+
+
+
+**AWS EC2 + Docker + Kong Gateway + PostgreSQL**
+
+This is simpler to understand than starting with Kubernetes, and it teaches you the core Kong concepts. Kong officially supports Docker deployments and PostgreSQL-backed deployments. ([Kong Docs][1])
+
+Below is a concrete setup you can follow.
+
+---
+
+# Architecture we'll build
+
+```text
+                         Internet
+                            │
+                            │ HTTP :80
+                            ▼
+                    ┌─────────────────┐
+                    │   AWS EC2       │
+                    │  Ubuntu 24.04   │
+                    │                 │
+                    │    Docker       │
+                    │      │          │
+                    │      ▼          │
+                    │  ┌───────────┐  │
+                    │  │   Kong    │  │
+                    │  │  Gateway  │  │
+                    │  └─────┬─────┘  │
+                    │        │        │
+                    │        ▼        │
+                    │  ┌───────────┐  │
+                    │  │ PostgreSQL│  │
+                    │  └───────────┘  │
+                    └─────────────────┘
+                            │
+                            ▼
+                      Your API/Backend
+```
+
+For a **production** system, I'd eventually change this to:
+
+```text
+Internet
+   │
+   ▼
+AWS ALB
+   │
+   ▼
+Kong
+   │
+   ├── User API
+   ├── Order API
+   └── Payment API
+```
+
+But let's first get Kong working.
+
+---
+
+# Step 1 — Create an EC2 instance
+
+Go to the official AWS EC2 console:
+
+[AWS EC2 Console](https://console.aws.amazon.com/ec2/?utm_source=chatgpt.com)
+
+Click:
+
+**Launch instance**
+
+Use approximately these settings:
+
+| Setting       | Value                                 |
+| ------------- | ------------------------------------- |
+| Name          | `kong-server`                         |
+| AMI           | Ubuntu Server 24.04 LTS               |
+| Architecture  | x86_64                                |
+| Instance type | `t3.small` for learning               |
+| Storage       | 20–30 GB                              |
+| Key pair      | Create/select your SSH key            |
+| VPC           | Your default VPC is fine for learning |
+| Public IP     | Enable                                |
+
+For a serious production deployment, sizing and architecture should be reviewed separately.
+
+---
+
+# Step 2 — Configure the Security Group
+
+This part is important.
+
+AWS Security Groups act as the firewall for your EC2 instance. ([AWS Documentation][2])
+
+Create something like:
+
+```text
+kong-sg
+```
+
+### Inbound rules
+
+For learning:
+
+| Type       | Port | Source     |
+| ---------- | ---: | ---------- |
+| SSH        |   22 | YOUR-IP/32 |
+| HTTP       |   80 | 0.0.0.0/0  |
+| HTTPS      |  443 | 0.0.0.0/0  |
+| Custom TCP | 8000 | YOUR-IP/32 |
+| Custom TCP | 8001 | YOUR-IP/32 |
+
+**Do not expose Kong's Admin API (8001) publicly in production.**
+
+AWS specifically recommends restricting SSH rather than allowing it from the entire internet. ([AWS Documentation][3])
+
+For our learning environment, we'll initially use port `8000` to test Kong.
+
+---
+
+# Step 3 — SSH into EC2
+
+After EC2 starts, copy its public IP.
+
+For example:
+
+```text
+3.110.20.50
+```
+
+From your computer:
+
+```bash
+ssh -i my-key.pem ubuntu@3.110.20.50
+```
+
+You should get:
+
+```text
+ubuntu@ip-172-31-xx-xx:~$
+```
+
+You're now inside your AWS server.
+
+---
+
+# Step 4 — Update Ubuntu
+
+Run:
+
+```bash
+sudo apt update
+```
+
+Then:
+
+```bash
+sudo apt upgrade -y
+```
+
+Install some basic tools:
+
+```bash
+sudo apt install -y curl git ca-certificates
+```
+
+---
+
+# Step 5 — Install Docker
+
+Run:
+
+```bash
+sudo apt install -y docker.io docker-compose-v2
+```
+
+Check Docker:
+
+```bash
+docker --version
+```
+
+You should see something similar to:
+
+```text
+Docker version xx.x.x
+```
+
+Start Docker:
+
+```bash
+sudo systemctl enable docker
+sudo systemctl start docker
+```
+
+Allow your Ubuntu user to run Docker:
+
+```bash
+sudo usermod -aG docker $USER
+```
+
+Then:
+
+```bash
+newgrp docker
+```
+
+Test:
+
+```bash
+docker run hello-world
+```
+
+If that works, Docker is ready.
+
+---
+
+# Step 6 — Create a Kong directory
+
+```bash
+mkdir ~/kong
+```
+
+Go inside:
+
+```bash
+cd ~/kong
+```
+
+Create:
+
+```bash
+mkdir -p kong
+```
+
+Your directory will look like:
+
+```text
+kong/
+└── kong/
+```
+
+---
+
+# Step 7 — Create `docker-compose.yml`
+
+Run:
+
+```bash
+nano docker-compose.yml
+```
+
+Paste this:
+
+```yaml
+services:
+
+  kong-database:
+    image: postgres:16
+    container_name: kong-database
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kongpassword
+      POSTGRES_DB: kong
+
+    volumes:
+      - kong_data:/var/lib/postgresql/data
+
+    networks:
+      - kong-net
+
+
+  kong-migrations:
+    image: kong:latest
+    container_name: kong-migrations
+
+    command: kong migrations bootstrap
+
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-database
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kongpassword
+      KONG_PG_DATABASE: kong
+
+    depends_on:
+      - kong-database
+
+    networks:
+      - kong-net
+
+
+  kong:
+    image: kong:latest
+    container_name: kong
+    restart: unless-stopped
+
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-database
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kongpassword
+      KONG_PG_DATABASE: kong
+
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+      - "8001:8001"
+      - "8444:8444"
+
+    depends_on:
+      kong-migrations:
+        condition: service_completed_successfully
+
+    networks:
+      - kong-net
+
+
+volumes:
+  kong_data:
+
+
+networks:
+  kong-net:
+```
+
+Save:
+
+```text
+CTRL + O
+ENTER
+CTRL + X
+```
+
+Kong's official Docker documentation uses Docker Compose and PostgreSQL for this style of deployment. ([Kong Docs][1])
+
+---
+
+# Step 8 — Start PostgreSQL
+
+First:
+
+```bash
+docker compose up -d kong-database
+```
+
+Check:
+
+```bash
+docker ps
+```
+
+You should see:
+
+```text
+kong-database
+```
+
+---
+
+# Step 9 — Run Kong database migration
+
+Now run:
+
+```bash
+docker compose run --rm kong-migrations
+```
+
+You should see Kong creating its database schema.
+
+The official Kong installation flow similarly initializes PostgreSQL with Kong migrations before starting the Gateway. ([Kong Docs][4])
+
+---
+
+# Step 10 — Start Kong
+
+Now:
+
+```bash
+docker compose up -d kong
+```
+
+Check:
+
+```bash
+docker ps
+```
+
+You should have:
+
+```text
+kong
+kong-database
+```
+
+---
+
+# Step 11 — Test Kong
+
+From your EC2 server:
+
+```bash
+curl http://localhost:8001
+```
+
+You should receive JSON containing information about Kong.
+
+For example, you'll see fields such as:
+
+```json
+{
+  "version": "...",
+  "hostname": "...",
+  "database": {
+    "reachable": true
+  }
+}
+```
+
+A successful `200` response from the Admin API indicates that Kong is running correctly. ([Kong Docs][1])
+
+---
+
+# Step 12 — Test from your laptop
+
+Find your EC2 public IP.
+
+For example:
+
+```text
+3.110.20.50
+```
+
+From your laptop:
+
+```bash
+curl http://3.110.20.50:8001
+```
+
+If you've allowed port `8001` from your IP in the Security Group, you should get Kong's response.
+
+**Important:** Don't leave port `8001` open to `0.0.0.0/0`.
+
+---
+
+# Step 13 — Now create your first API
+
+This is where you start actually **learning Kong**.
+
+We need an upstream application.
+
+For learning, let's use a public test API:
+
+```text
+https://httpbin.org
+```
+
+Create a Kong Service:
+
+```bash
+curl -i -X POST http://localhost:8001/services \
+  --data name=httpbin \
+  --data url=https://httpbin.org
+```
+
+Check it:
+
+```bash
+curl http://localhost:8001/services
+```
+
+You should see your `httpbin` service.
+
+---
+
+# Step 14 — Create a Route
+
+Now tell Kong:
+
+> When somebody requests `/httpbin`, send the request to my `httpbin` service.
+
+Run:
+
+```bash
+curl -i -X POST http://localhost:8001/services/httpbin/routes \
+  --data 'paths[]=/httpbin'
+```
+
+Now your architecture is:
+
+```text
+Client
+   │
+   │ GET /httpbin/get
+   ▼
+Kong :8000
+   │
+   │ Route
+   ▼
+httpbin.org
+```
+
+---
+
+# Step 15 — Test your first Kong API
+
+From your laptop:
+
+```bash
+curl http://3.110.20.50:8000/httpbin/get
+```
+
+If everything is correct:
+
+```text
+Client
+   │
+   ▼
+AWS EC2
+   │
+   ▼
+Kong :8000
+   │
+   ▼
+httpbin.org
+```
+
+🎉 **You have successfully deployed Kong Gateway on AWS and routed your first API through it.**
+
+---
+
+# Step 16 — Understand what you just built
+
+This is the most important part.
+
+You created:
+
+```text
+                Kong
+                  │
+       ┌──────────┴──────────┐
+       │                     │
+    Service                 Route
+       │                     │
+   httpbin              /httpbin
+       │
+       ▼
+https://httpbin.org
+```
+
+In Kong terminology:
+
+### Service
+
+Represents the upstream application.
+
+```text
+httpbin
+```
+
+### Route
+
+Defines how traffic reaches that service.
+
+```text
+/httpbin
+```
+
+### Gateway
+
+Receives:
+
+```text
+http://EC2-IP:8000/httpbin/get
+```
+
+and forwards it to:
+
+```text
+https://httpbin.org/get
+```
+
+That's the fundamental Kong concept.
+
+---
+
+# Step 17 — Add rate limiting
+
+Now you're going to see why Kong is useful.
+
+Create a rate-limit plugin:
+
+```bash
+curl -i -X POST http://localhost:8001/services/httpbin/plugins \
+  --data name=rate-limiting \
+  --data config.minute=10
+```
+
+Now your API is limited to approximately:
+
+```text
+10 requests / minute
+```
+
+instead of your backend having to implement the gateway-level policy itself.
+
+---
+
+# Step 18 — Add authentication
+
+Next, create a Consumer:
+
+```bash
+curl -i -X POST http://localhost:8001/consumers \
+  --data username=test-user
+```
+
+Then create an API key:
+
+```bash
+curl -i -X POST http://localhost:8001/consumers/test-user/key-auth \
+  --data key=my-secret-key
+```
+
+Enable Key Authentication on the service:
+
+```bash
+curl -i -X POST http://localhost:8001/services/httpbin/plugins \
+  --data name=key-auth
+```
+
+Now:
+
+```text
+Client
+   │
+   │ API Key
+   ▼
+Kong
+   │
+   ├── Authenticate
+   │
+   ├── Rate limit
+   │
+   ▼
+Backend
+```
+
+This is the point where Kong starts becoming an actual API management layer rather than simply a reverse proxy.
+
+---
+
+# Step 19 — Don't use this exact setup for production
+
+The setup above is **excellent for learning**, but don't put it directly into production.
+
+For production I'd recommend:
+
+```text
+                     Internet
+                        │
+                        ▼
+                  Route 53 / DNS
+                        │
+                        ▼
+                  AWS ALB / NLB
+                        │
+              ┌─────────┴─────────┐
+              │                   │
+           Kong #1             Kong #2
+              │                   │
+              └─────────┬─────────┘
+                        │
+                        ▼
+                  PostgreSQL/RDS
+                        │
+                        ▼
+                 Backend Services
+```
+
+And additionally:
+
+* HTTPS/TLS
+* AWS Certificate Manager
+* private subnets
+* ALB/NLB
+* RDS PostgreSQL
+* AWS Secrets Manager
+* CloudWatch
+* monitoring/alerting
+* restricted Admin API
+* backups
+* multiple Kong nodes
+* Auto Scaling / ECS / Kubernetes depending on your architecture
+
+Kong also documents using AWS Secrets Manager for database credentials. ([Kong Docs][5])
+
+---
+
+# One important decision
+
+There are actually **three good ways to run Kong on AWS**:
+
+| Option                            | Best for                       |
+| --------------------------------- | ------------------------------ |
+| **EC2 + Docker**                  | ⭐ Learning / small deployments |
+| **ECS + Kong**                    | Production without Kubernetes  |
+| **EKS + Kong Ingress Controller** | Kubernetes environments        |
+
+Kong officially supports Kubernetes deployment and Kong Ingress Controller as well. ([Kong Docs][6])
+
+### My recommendation for you
+
+Don't jump directly to EKS.
+
+Learn this progression:
+
+```text
+                    KONG LEARNING PATH
+
+                ┌────────────────────┐
+                │ 1. EC2 + Docker    │
+                └─────────┬──────────┘
+                          ↓
+                ┌────────────────────┐
+                │ 2. Service/Routes  │
+                └─────────┬──────────┘
+                          ↓
+                ┌────────────────────┐
+                │ 3. Plugins         │
+                │ JWT / API Key      │
+                │ Rate Limiting      │
+                └─────────┬──────────┘
+                          ↓
+                ┌────────────────────┐
+                │ 4. PostgreSQL/RDS  │
+                └─────────┬──────────┘
+                          ↓
+                ┌────────────────────┐
+                │ 5. HTTPS + ALB     │
+                └─────────┬──────────┘
+                          ↓
+                ┌────────────────────┐
+                │ 6. ECS             │
+                └─────────┬──────────┘
+                          ↓
+                ┌────────────────────┐
+                │ 7. Kubernetes/EKS  │
+                │ + Kong Ingress     │
+                └────────────────────┘
+```
+
