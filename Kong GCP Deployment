@@ -1,0 +1,863 @@
+Kong and deploy it on Google Cloud
+===================================
+Architecture
+===============
+We'll build this first:
+
+                         Internet
+                            │
+                            │
+                            ▼
+                  ┌──────────────────┐
+                  │  GCP External IP │
+                  └────────┬─────────┘
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │ Compute Engine   │
+                  │ Ubuntu 24.04     │
+                  │                  │
+                  │     Docker       │
+                  │       │          │
+                  │   ┌───▼────┐     │
+                  │   │  Kong  │     │
+                  │   └───┬────┘     │
+                  │       │           │
+                  │   ┌───▼───────┐   │
+                  │   │ PostgreSQL│   │
+                  │   └───────────┘   │
+                  └──────────────────┘
+                           │
+                           ▼
+                     Your Backend API
+
+
+
+For production, we'll eventually move toward:
+
+Internet
+   │
+   ▼
+Cloud DNS
+   │
+   ▼
+HTTPS Load Balancer
+   │
+   ▼
+Kong
+   │
+   ├── User API
+   ├── Order API
+   └── Payment API
+Part 1 — Create your GCP project
+
+Go to:
+
+Google Cloud Console
+
+Create a new project.
+
+For example:
+
+Project name:
+kong-learning
+
+Google Cloud requires a project for Compute Engine resources, and its current documentation recommends enabling the Compute Engine API before creating a VM.
+
+Part 2 — Enable Compute Engine
+
+Open:
+
+APIs & Services → Library
+
+Search for:
+
+Compute Engine API
+
+Click:
+
+Enable
+
+Or use Cloud Shell:
+
+gcloud services enable compute.googleapis.com
+
+Check:
+
+gcloud services list --enabled
+
+You should see:
+
+compute.googleapis.com
+Part 3 — Choose a region
+
+For learning, choose a region close to your users.
+
+For example:
+
+asia-south1
+
+This is Mumbai.
+
+Or:
+
+asia-south2
+
+Delhi.
+
+For the rest of this guide, I'll use:
+
+REGION=asia-south1
+ZONE=asia-south1-a
+
+Set them:
+
+gcloud config set compute/region asia-south1
+gcloud config set compute/zone asia-south1-a
+
+Check:
+
+gcloud config list
+Part 4 — Create the VM
+
+We'll use:
+
+VM name: kong-server
+Machine: e2-medium
+OS: Ubuntu 24.04 LTS
+Disk: 30 GB
+
+Google's current Compute Engine documentation supports Ubuntu 24.04 LTS for Linux VM creation.
+
+Run:
+
+gcloud compute instances create kong-server \
+    --zone=asia-south1-a \
+    --machine-type=e2-medium \
+    --image-family=ubuntu-2404-lts-amd64 \
+    --image-project=ubuntu-os-cloud \
+    --boot-disk-size=30GB \
+    --boot-disk-type=pd-balanced \
+    --tags=kong-server
+
+Wait for:
+
+NAME          ZONE           MACHINE_TYPE
+kong-server   asia-south1-a e2-medium
+Part 5 — Create firewall rules
+
+We need to allow traffic to Kong.
+
+Kong's standard ports include:
+
+8000  → Proxy HTTP
+8443  → Proxy HTTPS
+8001  → Admin API
+8444  → Admin API HTTPS
+
+The Google Cloud firewall rules determine which incoming traffic reaches the VM.
+
+Allow Kong HTTP
+
+Run:
+
+gcloud compute firewall-rules create allow-kong-http \
+    --network=default \
+    --direction=INGRESS \
+    --action=ALLOW \
+    --rules=tcp:8000 \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=kong-server
+Allow Kong HTTPS
+gcloud compute firewall-rules create allow-kong-https \
+    --network=default \
+    --direction=INGRESS \
+    --action=ALLOW \
+    --rules=tcp:8443 \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=kong-server
+Allow Admin API
+
+For learning, you can temporarily allow port 8001.
+
+Do not do this in production.
+
+gcloud compute firewall-rules create allow-kong-admin \
+    --network=default \
+    --direction=INGRESS \
+    --action=ALLOW \
+    --rules=tcp:8001 \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=kong-server
+
+Later we'll restrict this.
+
+Part 6 — Get the VM external IP
+
+Run:
+
+gcloud compute instances describe kong-server \
+    --zone=asia-south1-a \
+    --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
+
+You'll get something like:
+
+34.93.120.50
+
+Let's call this:
+
+KONG_IP=34.93.120.50
+Part 7 — SSH into the VM
+
+Run:
+
+gcloud compute ssh kong-server \
+    --zone=asia-south1-a
+
+You should now be inside your VM:
+
+username@kong-server:~$
+
+Everything from here happens inside the GCP VM unless I say otherwise.
+
+Part 8 — Update Ubuntu
+
+Run:
+
+sudo apt update
+
+Then:
+
+sudo apt upgrade -y
+
+Install utilities:
+
+sudo apt install -y \
+    curl \
+    git \
+    ca-certificates \
+    gnupg \
+    lsb-release
+Part 9 — Install Docker
+
+For this learning setup:
+
+sudo apt install -y docker.io docker-compose-v2
+
+Check:
+
+docker --version
+
+and:
+
+docker compose version
+
+You should get something like:
+
+Docker version ...
+Docker Compose version ...
+
+Start Docker:
+
+sudo systemctl enable docker
+sudo systemctl start docker
+
+Check:
+
+sudo systemctl status docker
+
+You want:
+
+Active: active (running)
+Part 10 — Allow your user to use Docker
+
+Run:
+
+sudo usermod -aG docker $USER
+
+Then:
+
+newgrp docker
+
+Test:
+
+docker run hello-world
+
+If you get:
+
+Hello from Docker!
+
+Docker is working.
+
+Part 11 — Create Kong directory
+
+Run:
+
+mkdir ~/kong
+
+Then:
+
+cd ~/kong
+
+Check:
+
+pwd
+
+You should have:
+
+/home/your-user/kong
+Part 12 — Create Docker Compose file
+
+Run:
+
+nano docker-compose.yml
+
+Paste:
+
+services:
+
+  kong-database:
+    image: postgres:16
+    container_name: kong-database
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kongpassword
+      POSTGRES_DB: kong
+
+    volumes:
+      - kong_data:/var/lib/postgresql/data
+
+    networks:
+      - kong-net
+
+
+  kong-migrations:
+    image: kong:latest
+    container_name: kong-migrations
+
+    command: kong migrations bootstrap
+
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-database
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kongpassword
+      KONG_PG_DATABASE: kong
+
+    depends_on:
+      - kong-database
+
+    networks:
+      - kong-net
+
+
+  kong:
+    image: kong:latest
+    container_name: kong
+    restart: unless-stopped
+
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-database
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kongpassword
+      KONG_PG_DATABASE: kong
+
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+      - "8001:8001"
+      - "8444:8444"
+
+    depends_on:
+      kong-migrations:
+        condition: service_completed_successfully
+
+    networks:
+      - kong-net
+
+
+volumes:
+  kong_data:
+
+
+networks:
+  kong-net:
+
+Save:
+
+CTRL + O
+ENTER
+CTRL + X
+
+This follows the same basic Docker Compose architecture documented by Kong: PostgreSQL, Kong migrations, and the Kong Gateway container.
+
+Part 13 — Start PostgreSQL
+
+Run:
+
+docker compose up -d kong-database
+
+Check:
+
+docker ps
+
+You should see:
+
+kong-database
+
+Check the logs:
+
+docker logs kong-database
+
+Look for PostgreSQL being ready.
+
+Part 14 — Run Kong database migration
+
+Now run:
+
+docker compose run --rm kong-migrations
+
+This initializes the Kong PostgreSQL schema.
+
+You should eventually see migration completion.
+
+Kong's documented Docker Compose deployment uses kong migrations bootstrap to initialize the database schema.
+
+Part 15 — Start Kong
+
+Run:
+
+docker compose up -d kong
+
+Check:
+
+docker ps
+
+You should have:
+
+kong
+kong-database
+Part 16 — Check Kong locally
+
+Inside your GCP VM:
+
+curl http://localhost:8001
+
+You should get JSON.
+
+Something similar to:
+
+{
+  "version": "...",
+  "database": {
+    "reachable": true
+  }
+}
+
+Kong's documentation uses a request to port 8001 to validate that the Gateway is running.
+
+Part 17 — Test Kong from your computer
+
+Remember the external IP:
+
+34.93.120.50
+
+From your own laptop:
+
+curl http://34.93.120.50:8001
+
+You should get Kong's JSON response.
+
+If you don't, check:
+
+docker ps
+
+and:
+
+sudo ss -lntp
+
+Also check the GCP firewall:
+
+gcloud compute firewall-rules list
+Part 18 — Create your first Kong Service
+
+Now we're going to actually use Kong.
+
+We'll use httpbin.org as a temporary backend.
+
+Inside the GCP VM:
+
+curl -i -X POST http://localhost:8001/services \
+    --data name=httpbin \
+    --data url=https://httpbin.org
+
+You should receive a 201 Created.
+
+Check:
+
+curl http://localhost:8001/services
+
+You should see:
+
+httpbin
+Part 19 — Create your first Kong Route
+
+Now create:
+
+/httpbin
+
+Run:
+
+curl -i -X POST \
+    http://localhost:8001/services/httpbin/routes \
+    --data 'paths[]=/httpbin'
+
+Now your architecture is:
+
+                    GCP
+                     │
+                     ▼
+              Kong :8000
+                     │
+                /httpbin
+                     │
+                     ▼
+               httpbin.org
+Part 20 — Test it
+
+From your laptop:
+
+curl http://34.93.120.50:8000/httpbin/get
+
+You should get a JSON response from httpbin.
+
+🎉 At this point you have:
+
+Google Cloud
+    │
+    ▼
+Compute Engine
+    │
+    ▼
+Docker
+    │
+    ▼
+Kong Gateway
+    │
+    ▼
+httpbin
+
+You've successfully deployed Kong on GCP.
+
+Part 21 — Learn Kong Service and Route
+
+Now understand these two concepts really well.
+
+Service
+httpbin
+       │
+       ▼
+https://httpbin.org
+
+The Service represents the upstream application.
+
+Route
+/httpbin
+
+The Route determines how the client reaches the Service.
+
+So:
+
+Client
+
+GET
+http://34.93.120.50:8000/httpbin/get
+
+          │
+          ▼
+
+        Kong
+
+          │
+          │ Route: /httpbin
+          ▼
+
+       httpbin
+
+          │
+          ▼
+
+https://httpbin.org/get
+
+This is the fundamental Kong architecture.
+
+Part 22 — Add API Key authentication
+
+Now let's make the API secure.
+
+Create a Consumer:
+
+curl -i -X POST \
+    http://localhost:8001/consumers \
+    --data username=test-user
+
+Create an API key:
+
+curl -i -X POST \
+    http://localhost:8001/consumers/test-user/key-auth \
+    --data key=my-secret-key
+
+Enable API key authentication:
+
+curl -i -X POST \
+    http://localhost:8001/services/httpbin/plugins \
+    --data name=key-auth
+
+Now try:
+
+curl http://34.93.120.50:8000/httpbin/get
+
+It should fail with an authentication error.
+
+Now send the key:
+
+curl \
+    -H "apikey: my-secret-key" \
+    http://34.93.120.50:8000/httpbin/get
+
+Now it should work.
+
+Your architecture has become:
+
+Client
+   │
+   │ API Key
+   ▼
+Kong
+   │
+   ├── Authenticate
+   │
+   ▼
+Backend
+Part 23 — Add rate limiting
+
+Now protect the API from excessive requests.
+
+Run:
+
+curl -i -X POST \
+    http://localhost:8001/services/httpbin/plugins \
+    --data name=rate-limiting \
+    --data config.minute=10
+
+Now Kong limits the service to approximately:
+
+10 requests / minute
+
+This is one of the major reasons to put Kong in front of APIs.
+
+Part 24 — Add CORS
+
+If your frontend is running in a browser, you may need CORS.
+
+Example:
+
+curl -i -X POST \
+    http://localhost:8001/services/httpbin/plugins \
+    --data name=cors \
+    --data 'config.origins=*'
+
+For production, don't blindly use:
+
+*
+
+Instead configure your real frontend domain.
+
+For example:
+
+https://app.example.com
+Part 25 — Your GCP architecture now looks like this
+                         Internet
+                            │
+                            ▼
+                    GCP External IP
+                     34.xx.xx.xx
+                            │
+                     ┌──────┴──────┐
+                     │             │
+                   :8000         :8001
+                     │             │
+                     ▼             ▼
+                  KONG          Admin API
+                     │
+             ┌───────┼────────┐
+             │       │        │
+             ▼       ▼        ▼
+          Auth     Rate      CORS
+                     │
+                     ▼
+                 Backend APIs
+Part 26 — Important: secure the Admin API
+
+Do not leave this:
+
+8001 → 0.0.0.0/0
+
+on a production system.
+
+Port 8001 is the Kong Admin API.
+
+It should be accessible only from trusted management locations.
+
+For example, find your current firewall rule:
+
+gcloud compute firewall-rules list
+
+Then remove the public rule:
+
+gcloud compute firewall-rules delete allow-kong-admin
+
+For learning, you can instead create a rule that only allows your public IP:
+
+gcloud compute firewall-rules create allow-kong-admin-my-ip \
+    --network=default \
+    --direction=INGRESS \
+    --action=ALLOW \
+    --rules=tcp:8001 \
+    --source-ranges=YOUR_PUBLIC_IP/32 \
+    --target-tags=kong-server
+
+Replace:
+
+YOUR_PUBLIC_IP
+
+with your actual public IP.
+
+Part 27 — Don't expose PostgreSQL
+
+Notice that our Docker Compose file does not publish:
+
+5432:5432
+
+to the internet.
+
+That's intentional.
+
+Your database should remain internal:
+
+Kong
+  │
+  │ Docker network
+  ▼
+PostgreSQL
+
+not:
+
+Internet
+   │
+   ▼
+PostgreSQL :5432
+
+Never expose PostgreSQL publicly just to make Kong work.
+
+Part 28 — Production GCP architecture
+
+Once you've learned the above, I would not use a single VM for production.
+
+A more realistic architecture is:
+
+                         Internet
+                            │
+                            ▼
+                   Cloud DNS
+                            │
+                            ▼
+               Google Cloud HTTPS LB
+                            │
+                            ▼
+                   ┌────────────────┐
+                   │      Kong      │
+                   │                │
+                   │   Kong #1      │
+                   │   Kong #2      │
+                   │   Kong #3      │
+                   └───────┬────────┘
+                           │
+                           ▼
+                    Cloud SQL
+                    PostgreSQL
+                           │
+                           │
+             ┌─────────────┼─────────────┐
+             ▼             ▼             ▼
+         User API      Order API     Payment API
+
+You can use:
+
+Compute Engine or GKE for Kong
+Cloud SQL PostgreSQL for Kong's database
+Cloud Load Balancing in front
+Cloud DNS
+Google-managed SSL certificates
+Secret Manager
+Cloud Monitoring
+Cloud Logging
+private networking
+multiple Kong instances
+Part 29 — What you should learn next
+
+Since you're learning Kong rather than just deploying it, I'd follow this sequence:
+
+                    KONG + GCP
+                        │
+                        ▼
+             ┌───────────────────┐
+             │ 1. Compute Engine │
+             │    + Docker       │
+             └─────────┬─────────┘
+                       ▼
+             ┌───────────────────┐
+             │ 2. Service        │
+             │ 3. Route          │
+             └─────────┬─────────┘
+                       ▼
+             ┌───────────────────┐
+             │ 4. Plugins        │
+             │    API Key        │
+             │    JWT            │
+             │    CORS           │
+             │    Rate Limit     │
+             └─────────┬─────────┘
+                       ▼
+             ┌───────────────────┐
+             │ 5. PostgreSQL     │
+             │    → Cloud SQL    │
+             └─────────┬─────────┘
+                       ▼
+             ┌───────────────────┐
+             │ 6. HTTPS          │
+             │    Cloud LB       │
+             └─────────┬─────────┘
+                       ▼
+             ┌───────────────────┐
+             │ 7. Secrets        │
+             │    Monitoring     │
+             └─────────┬─────────┘
+                       ▼
+             ┌───────────────────┐
+             │ 8. GKE            │
+             │    + Kong Ingress │
+             └───────────────────┘
+
+Kong supports Docker, traditional database-backed deployments, DB-less deployments, and Kubernetes deployments
